@@ -5,6 +5,8 @@
 #include <emmintrin.h>
 #include <immintrin.h>
 #include <time.h>
+#include <algorithm>
+#include <vector>
 #include <sys/mman.h>
 
 #define ASSERT(x) \
@@ -30,10 +32,12 @@ enum RunName {
     RnDecodeSimdFloat,
     RnEncodeSimdDouble,
     RnDecodeSimdDouble,
+#ifdef __AVX2__
     RnEncodeAVX2Float,
     RnDecodeAVX2Float,
     RnEncodeAVX2Double,
     RnDecodeAVX2Double,
+#endif
     RnEnd,
 
 };
@@ -58,6 +62,7 @@ const char* CovertRnNameToString(RunName name) {
             return "encode_simd_double";
         case RnDecodeSimdDouble:
             return "decode_simd_double";
+#ifdef __AVX2__
         case RnEncodeAVX2Float:
             return "encode_avx2_float";
         case RnDecodeAVX2Float:
@@ -66,6 +71,7 @@ const char* CovertRnNameToString(RunName name) {
             return "encode_avx2_double";
         case RnDecodeAVX2Double:
             return "decode_avx2_double";
+#endif
         default:
             ASSERT(!"Unknown name");
             return NULL;
@@ -276,6 +282,7 @@ void decode_simd_double(const uint8_t *input_data, size_t num_elements, uint8_t 
     }
 }
 
+#ifdef __AVX2__
 void encode_avx2_float(const uint8_t *input_data, size_t num_elements, uint8_t *output_data) {
     // We will not handle the special case here and assume size is divisble 32 * 4.
     __m256i s[4];
@@ -471,6 +478,7 @@ void decode_avx2_double(const uint8_t *input_data, size_t num_elements, uint8_t 
         _mm256_storeu_si256((__m256i*)(output_data + off + 224UL), p[7]);
     }
 }
+#endif
 
 double benchmark_path(RunName name, const uint8_t *input, size_t num_bytes, uint8_t *output, const size_t num_runs)
 {
@@ -480,16 +488,20 @@ double benchmark_path(RunName name, const uint8_t *input, size_t num_bytes, uint
         case RnDecodeScalarFloat:
         case RnEncodeSimdFloat:
         case RnDecodeSimdFloat:
+#ifdef __AVX2__
         case RnEncodeAVX2Float:
         case RnDecodeAVX2Float:
+#endif
             num_elements = num_bytes / 4UL;
             break;
         case RnEncodeScalarDouble:
         case RnDecodeScalarDouble:
         case RnEncodeSimdDouble:
         case RnDecodeSimdDouble:
+#ifdef __AVX2__
         case RnEncodeAVX2Double:
         case RnDecodeAVX2Double:
+#endif
             num_elements = num_bytes / 8UL;
             break;
         case RnMemcpy:
@@ -503,6 +515,7 @@ double benchmark_path(RunName name, const uint8_t *input, size_t num_bytes, uint
     memcpy(output, input, num_bytes);
 
     double total_time = .0;
+    double min_time = 1e123;
     for (size_t i = 0; i < num_runs; ++i) {
         double t1 = gettime();
         switch(name) {
@@ -533,6 +546,7 @@ double benchmark_path(RunName name, const uint8_t *input, size_t num_bytes, uint
             case RnDecodeSimdDouble:
                 decode_simd_double(input, num_elements, output);
                 break;
+#ifdef __AVX2__
             case RnEncodeAVX2Float:
                 encode_avx2_float(input, num_elements, output);
                 break;
@@ -545,16 +559,23 @@ double benchmark_path(RunName name, const uint8_t *input, size_t num_bytes, uint
             case RnDecodeAVX2Double:
                 decode_avx2_double(input, num_elements, output);
                 break;
+#endif
             default:
                 ASSERT(!"Unknown name");
                 return .0;
         }
         double t2 = gettime();
-        total_time += (t2 - t1);
+	const double time_delta = t2-t1;
+        total_time += time_delta;
+	min_time = std::min(min_time, time_delta);
+
     }
     const uint64_t total_bytes_processed = num_runs * num_bytes;
     const double avg_bytes_per_s = total_bytes_processed / total_time;
+    const double max_bytes_per_s = num_bytes / min_time;
     const double avg_gibs_per_s = avg_bytes_per_s / (1024.0 * 1024.0 * 1024.0);
+    const double max_gibs_per_s = max_bytes_per_s / (1024.0 * 1024.0 * 1024.0);
+    return max_gibs_per_s;
     return avg_gibs_per_s;
 }
 
@@ -603,6 +624,7 @@ void test_all_encodings() {
         ASSERT(!"decode_simd_double failed");
     }
 
+#ifdef __AVX2__
     // Check that encode_avx2_float and decode_avx2_float work correctly.
     encode_avx2_float(input, num_elements_float, output);
     if (memcmp(expected_output_float, output, num_bytes)) {
@@ -625,7 +647,7 @@ void test_all_encodings() {
         }
         ASSERT(!"decode_avx2_double failed");
     }
-
+#endif
     free(input);
     free(output);
     free(expected_output_float);
@@ -633,22 +655,24 @@ void test_all_encodings() {
 }
 
 void benchmark_all_encodings() {
-    const size_t size_MiB = 1;
-    const size_t num_bytes = size_MiB * 1024 * 1024;
-    const size_t num_runs = 4096;
-    printf("Testing %zu MiB.\n", size_MiB);
+    const size_t max_num_bytes = 32 * 1024 * 1024;
+    const size_t num_runs = 256;
     printf("Averaging over %zu runs.\n", num_runs);
-    uint8_t *input = (uint8_t*)malloc(num_bytes);
-    uint8_t *output = (uint8_t*)malloc(num_bytes);
+    uint8_t *input = (uint8_t*)malloc(max_num_bytes);
+    uint8_t *output = (uint8_t*)malloc(max_num_bytes);
     srand(1337);
-    for (size_t i = 0; i < num_bytes; ++i) {
+    for (size_t i = 0; i < max_num_bytes; ++i) {
         input[i] = (uint8_t)rand();
     }
-    for (size_t i = RnStart; i < RnEnd; ++i) {
-        RunName name = (RunName)i;
-        const char *name_s = CovertRnNameToString(name);
-        double avg_gibs_per_s = benchmark_path(name, input, num_bytes, output, num_runs);
-        printf("%s: %lf GiB/s\n", name_s, avg_gibs_per_s);
+    for (size_t num_kbytes: std::vector<size_t>({32,64,96,128,196,256,512,768,1024,2048,4096,8*1024,12*1024,16*1024, 20*1024, 24*1024,32*1024})) {
+        const size_t num_bytes = std::min(num_kbytes*1024, max_num_bytes);
+        printf("Testing %zu KiB.\n", num_bytes/1024);
+        for (size_t i = RnStart; i < RnEnd; ++i) {
+            const RunName name = (RunName)i;
+            const char *name_s = CovertRnNameToString(name);
+            double avg_gibs_per_s = benchmark_path(name, input, num_bytes, output, num_runs);
+            printf("%s: %lf GiB/s\n", name_s, avg_gibs_per_s);
+        }
     }
     free(input);
     free(output);
